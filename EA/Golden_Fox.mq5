@@ -23,7 +23,7 @@ input double             RVI_Zone        = 0.050;  // No-trade zone boundary (±
 
 input group              "=== Risk ==="
 input double             LotSize         = 0.01;   // Fixed lot size per trade
-input double             RR_Ratio        = 1.5;    // TP = Risk × RR_Ratio
+input double             TP_Pips   = 100;          // Take profit in pips
 input double             MaxLotCap       = 0.12;   // Hard lot ceiling
 
 input group              "=== Breakeven ==="
@@ -81,8 +81,6 @@ int OnInit()
    dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dayStartTime    = TimeCurrent();
 
-   Print("Golden Fox EA v2.3 initialized. Lot=", LotSize,
-         " RR=1:", RR_Ratio, " BE_Trigger=$", BreakevenTrigger);
    return INIT_SUCCEEDED;
 }
 
@@ -181,9 +179,9 @@ int GetSignal()
 
 //+------------------------------------------------------------------+
 //| Trade Execution                                                  |
-//| SL  : First SAR dot of the new trend (SAR[1])                   |
-//| TP  : Entry ± (|Entry − SL| × RR_Ratio)                        |
-//| Lot : Static LotSize input (default 0.01)                       |
+//| SL  : First SAR dot of the new trend (SAR[1])                    |
+//| TP  : Entry ± (100 pips)                                         |
+//| Lot : Static LotSize input (default 0.01)                        |
 //+------------------------------------------------------------------+
 void ExecuteTrade(int signal)
 {
@@ -201,7 +199,7 @@ void ExecuteTrade(int signal)
       double sl   = NormalizeDouble(sar1[0], _Digits);
       double risk = ask - sl;
       if(risk <= 0) return;
-      double tp   = NormalizeDouble(ask + risk * RR_Ratio, _Digits);
+      double tp = NormalizeDouble(ask + PipsToPrice(TP_Pips), _Digits);
       if(trade.Buy(lots, _Symbol, ask, sl, tp, "GoldenFox_BUY"))
          breakevenMoved = false;
    }
@@ -210,7 +208,7 @@ void ExecuteTrade(int signal)
       double sl   = NormalizeDouble(sar1[0], _Digits);
       double risk = sl - bid;
       if(risk <= 0) return;
-      double tp   = NormalizeDouble(bid - risk * RR_Ratio, _Digits);
+      double tp = NormalizeDouble(bid - PipsToPrice(TP_Pips), _Digits);
       if(trade.Sell(lots, _Symbol, bid, sl, tp, "GoldenFox_SELL"))
          breakevenMoved = false;
    }
@@ -333,5 +331,16 @@ bool InSession()
    int h = dt.hour;
    return (h >= LondonOpen && h < LondonClose) ||
           (h >= NYOpen     && h < NYClose);
+}
+
+double PipsToPrice(double pips)
+{
+   double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   // XAUUSD typically 0.01 point = 1 pip
+   if(_Digits == 3 || _Digits == 5)
+      pipSize *= 10;
+
+   return pips * pipSize;
 }
 //+------------------------------------------------------------------+
