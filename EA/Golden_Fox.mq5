@@ -2,10 +2,10 @@
 //| XAUUSD Scalp-Intraday EA                                        |
 //| Strategy : 6 EMA + SAR + RVI(10) zone + H1/H4 EMA + ADX filter  |
 //| Platform  : MetaTrader 5 (MQL5)                                 |
-//| Version   : 2.3                                                 |
-//| Changes   : Static configurable lot size (default 0.01).        |
-//|             Trailing SL: move to breakeven when floating         |
-//|             profit reaches BreakevenTrigger (default $2.00).     |
+//| Version   : 2.4                                                 |
+//| Changes   : RVI entry uses fresh cross detection, not trend      |
+//|             continuation. Captures initial impulse on the bar    |
+//|             the cross fires — reduces late-entry lag on M15.     |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
@@ -115,9 +115,11 @@ void OnTick()
 //+------------------------------------------------------------------+
 //| Signal Logic                                                     |
 //|                                                                  |
-//| BUY  : Both RVI lines trending UP  AND both BELOW -RVI_Zone     |
-//| SELL : Both RVI lines trending DOWN AND both ABOVE +RVI_Zone     |
-//| BLOCK: Both lines inside ±RVI_Zone → no trade (weak momentum)   |
+//| BUY  : RVI fresh cross UP  (M2 below, M1 above signal)          |
+//|        AND rviM1 still below -RVI_Zone (oversold territory)      |
+//| SELL : RVI fresh cross DOWN (M2 above, M1 below signal)         |
+//|        AND rviM1 still above +RVI_Zone (overbought territory)    |
+//| BLOCK: No fresh cross detected on last closed bar                |
 //+------------------------------------------------------------------+
 int GetSignal()
 {
@@ -146,33 +148,30 @@ int GetSignal()
    // Gate 1: ADX regime filter — trending markets only
    if(adx[0] < ADX_Min) return 0;
 
-   // Gate 2: RVI no-trade zone — block when BOTH lines are inside ±RVI_Zone
-   bool rviChop = (rviM1[0] > -RVI_Zone && rviM1[0] < RVI_Zone) &&
-                   (rviS1[0] > -RVI_Zone && rviS1[0] < RVI_Zone);
-   if(rviChop) return 0;
-
    double h1Price = iClose(_Symbol, PERIOD_H1, 0);
    double h4Price = iClose(_Symbol, PERIOD_H4, 0);
 
-   // BUY: both RVI lines trending UP and BELOW -RVI_Zone
-   bool buyRVI_trend = rviM1[0] > rviM2[0] && rviS1[0] > rviS2[0];
-   bool buyRVI_zone  = rviM1[0] < -RVI_Zone && rviS1[0] < -RVI_Zone;
+   // BUY: fresh RVI cross UP on bar[1], main still below -RVI_Zone
+   bool buyRVI_cross = rviM2[0] < rviS2[0] &&   // prev bar: main below signal
+                       rviM1[0] > rviS1[0] &&   // curr bar: main crossed above signal
+                       rviM1[0] < -RVI_Zone;    // cross happened in oversold territory
    bool buyEMA       = close1[0] > ema1[0];
    bool buySAR       = sar1[0]   < low1[0];
    bool buyH1        = h1Price   > h1ema[0];
    bool buyH4        = h4Price   > h4ema[0];
 
-   if(buyEMA && buySAR && buyRVI_trend && buyRVI_zone && buyH1 && buyH4) return 1;
+   if(buyRVI_cross && buyEMA && buySAR && buyH1 && buyH4) return 1;
 
-   // SELL: both RVI lines trending DOWN and ABOVE +RVI_Zone
-   bool sellRVI_trend = rviM1[0] < rviM2[0] && rviS1[0] < rviS2[0];
-   bool sellRVI_zone  = rviM1[0] > RVI_Zone  && rviS1[0] > RVI_Zone;
+   // SELL: fresh RVI cross DOWN on bar[1], main still above +RVI_Zone
+   bool sellRVI_cross = rviM2[0] > rviS2[0] &&  // prev bar: main above signal
+                        rviM1[0] < rviS1[0] &&  // curr bar: main crossed below signal
+                        rviM1[0] > RVI_Zone;    // cross happened in overbought territory
    bool sellEMA       = close1[0] < ema1[0];
    bool sellSAR       = sar1[0]   > high1[0];
    bool sellH1        = h1Price   < h1ema[0];
    bool sellH4        = h4Price   < h4ema[0];
 
-   if(sellEMA && sellSAR && sellRVI_trend && sellRVI_zone && sellH1 && sellH4) return -1;
+   if(sellRVI_cross && sellEMA && sellSAR && sellH1 && sellH4) return -1;
 
    return 0;
 }
