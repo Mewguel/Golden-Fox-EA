@@ -96,12 +96,32 @@ if(sellEMA && sellSAR && sellRVI_trend && sellRVI_zone && sellH1 && sellH4 && se
 
 ---
 
-## SL / TP
+## SL / TP (v2.2)
 
+### Stop Loss — SAR Anchored
+SL is set exactly at the **first SAR dot of the new trend** (bar[1] value):
+- **Buy** → SL = SAR dot **below** entry (SAR[1] < low)
+- **Sell** → SL = SAR dot **above** entry (SAR[1] > high)
+
+Risk (R) = |Entry Price − SL Price|
+
+Sanity check: if `risk ≤ 0` (SAR on wrong side of entry), skip the trade.
+
+### Take Profit — 1:1.5 RR
 ```
-SL_dist = ATR(14)[1] × ATR_Multiplier   // default 1.2
-TP_dist = SL_dist × RR_Ratio            // default 2.0
+TP (Buy)  = Entry + (R × RR_Ratio)   // default RR_Ratio = 1.5
+TP (Sell) = Entry - (R × RR_Ratio)
 ```
+
+Example (Short):
+```
+Entry : 1.2000
+SL    : 1.2010  (first SAR dot above — 10 pip risk)
+R     : 0.0010
+TP    : 1.2000 - (0.0010 × 1.5) = 1.1985  (15 pip reward)
+```
+
+> ATR_Multiplier is removed in v2.2 — SAR is the sole SL source.
 
 ---
 

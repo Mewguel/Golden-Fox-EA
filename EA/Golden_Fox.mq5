@@ -2,11 +2,12 @@
 //| XAUUSD Scalp-Intraday EA                                        |
 //| Strategy : 6 EMA + SAR + RVI(10) zone + H1/H4 EMA + ADX filter  |
 //| Platform  : MetaTrader 5 (MQL5)                                 |
-//| Version   : 2.1                                                 |
-//| Changes   : RVI entry rule — both lines must trend AND sit       |
-//|             outside ±RVI_Zone (0.050) to qualify as signal.      |
-//|             No-trade zone blocks entries when both RVI lines      |
-//|             are inside -0.050 to +0.050 (weak momentum).         |
+//| Version   : 2.2                                                 |
+//| Changes   : SL anchored to first SAR dot of new trend.          |
+//|             Buy  → SL at SAR dot below entry.                   |
+//|             Sell → SL at SAR dot above entry.                   |
+//|             TP fixed at 1:1.5 RR (Risk × 1.5).                 |
+//|             ATR_Multiplier removed — SAR is the SL source now.  |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
@@ -20,13 +21,11 @@ input int                H1_EMA_Period   = 50;
 input int                H4_EMA_Period   = 21;
 input int                ADX_Period      = 14;
 input double             ADX_Min         = 25.0;
-input int                ATR_Period      = 14;
 input double             RVI_Zone        = 0.050;  // No-trade zone boundary (±)
 
 input group              "=== Risk ==="
 input double             RiskPercent     = 5.0;
-input double             ATR_Multiplier  = 1.2;
-input double             RR_Ratio        = 2.0;
+input double             RR_Ratio        = 1.5;    // Fixed 1:1.5 RR (Risk × 1.5)
 input double             MaxLotCap       = 0.12;
 
 input group              "=== Exit Logic ==="
@@ -49,7 +48,7 @@ input int                MagicNumber     = 202402;
 input int                MaxSlippage     = 30;
 
 //--- Handles
-int hEMA_M15, hSAR_M15, hRVI_M15, hEMA_H1, hEMA_H4, hATR_M15, hADX_M15;
+int hEMA_M15, hSAR_M15, hRVI_M15, hEMA_H1, hEMA_H4, hADX_M15;
 
 //--- Globals
 CTrade      trade;
@@ -69,13 +68,11 @@ int OnInit()
    hRVI_M15 = iRVI(_Symbol, PERIOD_M15, RVI_Period);
    hEMA_H1  = iMA(_Symbol, PERIOD_H1,  H1_EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
    hEMA_H4  = iMA(_Symbol, PERIOD_H4,  H4_EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
-   hATR_M15 = iATR(_Symbol, PERIOD_M15, ATR_Period);
    hADX_M15 = iADX(_Symbol, PERIOD_M15, ADX_Period);
 
    if(hEMA_M15 == INVALID_HANDLE || hSAR_M15 == INVALID_HANDLE ||
       hRVI_M15 == INVALID_HANDLE || hEMA_H1  == INVALID_HANDLE ||
-      hEMA_H4  == INVALID_HANDLE || hATR_M15 == INVALID_HANDLE ||
-      hADX_M15 == INVALID_HANDLE)
+      hEMA_H4  == INVALID_HANDLE || hADX_M15 == INVALID_HANDLE)
    {
       Print("ERROR: Failed to create indicator handles.");
       return INIT_FAILED;
@@ -88,8 +85,8 @@ int OnInit()
    dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dayStartTime    = TimeCurrent();
 
-   Print("Golden Fox EA v2.1 initialized. ADX_Min=", ADX_Min,
-         " H4_EMA=", H4_EMA_Period, " RVI_Zone=", RVI_Zone);
+   Print("Golden Fox EA v2.2 initialized. ADX_Min=", ADX_Min,
+         " RR=1:", RR_Ratio, " RVI_Zone=", RVI_Zone, " SL=SAR-anchored");
    return INIT_SUCCEEDED;
 }
 
@@ -101,7 +98,6 @@ void OnDeinit(const int reason)
    IndicatorRelease(hRVI_M15);
    IndicatorRelease(hEMA_H1);
    IndicatorRelease(hEMA_H4);
-   IndicatorRelease(hATR_M15);
    IndicatorRelease(hADX_M15);
 }
 
@@ -189,40 +185,46 @@ int GetSignal()
 
 //+------------------------------------------------------------------+
 //| Trade Execution                                                  |
+//| SL  : First SAR dot of the new trend (SAR value at bar[1])      |
+//| TP  : Entry ± (|Entry - SL| × RR_Ratio)  — default 1:1.5       |
 //+------------------------------------------------------------------+
 void ExecuteTrade(int signal)
 {
-   double atr[1];
-   if(CopyBuffer(hATR_M15, 0, 1, 1, atr) < 1) return;
-
-   double slDist = atr[0] * ATR_Multiplier;
-   double tpDist = slDist * RR_Ratio;
-   double lots   = CalcLotSize(slDist);
-
-   if(lots <= 0) return;
+   double sar1[1];
+   if(CopyBuffer(hSAR_M15, 0, 1, 1, sar1) < 1) return;
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    if(signal == 1)
    {
-      double sl = NormalizeDouble(ask - slDist, _Digits);
-      double tp = NormalizeDouble(ask + tpDist, _Digits);
+      double sl    = NormalizeDouble(sar1[0], _Digits);   // SAR dot below price
+      double risk  = ask - sl;
+      if(risk <= 0) return;                               // SAR above entry — invalid
+      double tp    = NormalizeDouble(ask + risk * RR_Ratio, _Digits);
+      double lots  = CalcLotSize(risk);
+      if(lots <= 0) return;
+
       if(trade.Buy(lots, _Symbol, ask, sl, tp, "GoldenFox_BUY"))
       {
          tradeOpenPrice = ask;
-         tradeSLDist    = slDist;
+         tradeSLDist    = risk;
          partialDone    = false;
       }
    }
    else if(signal == -1)
    {
-      double sl = NormalizeDouble(bid + slDist, _Digits);
-      double tp = NormalizeDouble(bid - tpDist, _Digits);
+      double sl    = NormalizeDouble(sar1[0], _Digits);   // SAR dot above price
+      double risk  = sl - bid;
+      if(risk <= 0) return;                               // SAR below entry — invalid
+      double tp    = NormalizeDouble(bid - risk * RR_Ratio, _Digits);
+      double lots  = CalcLotSize(risk);
+      if(lots <= 0) return;
+
       if(trade.Sell(lots, _Symbol, bid, sl, tp, "GoldenFox_SELL"))
       {
          tradeOpenPrice = bid;
-         tradeSLDist    = slDist;
+         tradeSLDist    = risk;
          partialDone    = false;
       }
    }
