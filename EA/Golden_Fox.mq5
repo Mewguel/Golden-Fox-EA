@@ -2,12 +2,10 @@
 //| XAUUSD Scalp-Intraday EA                                        |
 //| Strategy : 6 EMA + SAR + RVI(10) zone + H1/H4 EMA + ADX filter  |
 //| Platform  : MetaTrader 5 (MQL5)                                 |
-//| Version   : 2.2                                                 |
-//| Changes   : SL anchored to first SAR dot of new trend.          |
-//|             Buy  → SL at SAR dot below entry.                   |
-//|             Sell → SL at SAR dot above entry.                   |
-//|             TP fixed at 1:1.5 RR (Risk × 1.5).                 |
-//|             ATR_Multiplier removed — SAR is the SL source now.  |
+//| Version   : 2.3                                                 |
+//| Changes   : Static configurable lot size (default 0.01).        |
+//|             Trailing SL: move to breakeven when floating         |
+//|             profit reaches BreakevenTrigger (default $2.00).     |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
@@ -24,13 +22,13 @@ input double             ADX_Min         = 25.0;
 input double             RVI_Zone        = 0.050;  // No-trade zone boundary (±)
 
 input group              "=== Risk ==="
-input double             RiskPercent     = 5.0;
-input double             RR_Ratio        = 1.5;    // Fixed 1:1.5 RR (Risk × 1.5)
-input double             MaxLotCap       = 0.12;
+input double             LotSize         = 0.01;   // Fixed lot size per trade
+input double             RR_Ratio        = 1.5;    // TP = Risk × RR_Ratio
+input double             MaxLotCap       = 0.12;   // Hard lot ceiling
 
-input group              "=== Exit Logic ==="
-input bool               UsePartialClose = false;
-input double             PartialClosePct = 0.60;
+input group              "=== Breakeven ==="
+input double             BreakevenTrigger = 2.00;  // Float profit in $ to move SL to BE
+
 
 input group              "=== Daily Guard ==="
 input int                MaxDailyLosses  = 3;
@@ -56,9 +54,7 @@ datetime    lastBarTime     = 0;
 double      dayStartBalance = 0;
 datetime    dayStartTime    = 0;
 int         dailyLosses     = 0;
-bool        partialDone     = false;
-double      tradeOpenPrice  = 0;
-double      tradeSLDist     = 0;
+bool        breakevenMoved  = false;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -85,8 +81,8 @@ int OnInit()
    dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dayStartTime    = TimeCurrent();
 
-   Print("Golden Fox EA v2.2 initialized. ADX_Min=", ADX_Min,
-         " RR=1:", RR_Ratio, " RVI_Zone=", RVI_Zone, " SL=SAR-anchored");
+   Print("Golden Fox EA v2.3 initialized. Lot=", LotSize,
+         " RR=1:", RR_Ratio, " BE_Trigger=$", BreakevenTrigger);
    return INIT_SUCCEEDED;
 }
 
@@ -185,53 +181,45 @@ int GetSignal()
 
 //+------------------------------------------------------------------+
 //| Trade Execution                                                  |
-//| SL  : First SAR dot of the new trend (SAR value at bar[1])      |
-//| TP  : Entry ± (|Entry - SL| × RR_Ratio)  — default 1:1.5       |
+//| SL  : First SAR dot of the new trend (SAR[1])                   |
+//| TP  : Entry ± (|Entry − SL| × RR_Ratio)                        |
+//| Lot : Static LotSize input (default 0.01)                       |
 //+------------------------------------------------------------------+
 void ExecuteTrade(int signal)
 {
    double sar1[1];
    if(CopyBuffer(hSAR_M15, 0, 1, 1, sar1) < 1) return;
 
+   double lots = NormalizeLot(LotSize);
+   if(lots <= 0) return;
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    if(signal == 1)
    {
-      double sl    = NormalizeDouble(sar1[0], _Digits);   // SAR dot below price
-      double risk  = ask - sl;
-      if(risk <= 0) return;                               // SAR above entry — invalid
-      double tp    = NormalizeDouble(ask + risk * RR_Ratio, _Digits);
-      double lots  = CalcLotSize(risk);
-      if(lots <= 0) return;
-
+      double sl   = NormalizeDouble(sar1[0], _Digits);
+      double risk = ask - sl;
+      if(risk <= 0) return;
+      double tp   = NormalizeDouble(ask + risk * RR_Ratio, _Digits);
       if(trade.Buy(lots, _Symbol, ask, sl, tp, "GoldenFox_BUY"))
-      {
-         tradeOpenPrice = ask;
-         tradeSLDist    = risk;
-         partialDone    = false;
-      }
+         breakevenMoved = false;
    }
    else if(signal == -1)
    {
-      double sl    = NormalizeDouble(sar1[0], _Digits);   // SAR dot above price
-      double risk  = sl - bid;
-      if(risk <= 0) return;                               // SAR below entry — invalid
-      double tp    = NormalizeDouble(bid - risk * RR_Ratio, _Digits);
-      double lots  = CalcLotSize(risk);
-      if(lots <= 0) return;
-
+      double sl   = NormalizeDouble(sar1[0], _Digits);
+      double risk = sl - bid;
+      if(risk <= 0) return;
+      double tp   = NormalizeDouble(bid - risk * RR_Ratio, _Digits);
       if(trade.Sell(lots, _Symbol, bid, sl, tp, "GoldenFox_SELL"))
-      {
-         tradeOpenPrice = bid;
-         tradeSLDist    = risk;
-         partialDone    = false;
-      }
+         breakevenMoved = false;
    }
 }
 
 //+------------------------------------------------------------------+
 //| Position Management                                              |
+//| - RVI cross reversal → close immediately                        |
+//| - Floating profit ≥ BreakevenTrigger ($) → move SL to BE        |
 //+------------------------------------------------------------------+
 void ManageOpenPosition()
 {
@@ -240,21 +228,18 @@ void ManageOpenPosition()
    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
    double curSL     = PositionGetDouble(POSITION_SL);
    double curTP     = PositionGetDouble(POSITION_TP);
-   double lots      = PositionGetDouble(POSITION_VOLUME);
    long   posType   = PositionGetInteger(POSITION_TYPE);
-   ulong  ticket    = PositionGetInteger(POSITION_TICKET);
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double price = (posType == POSITION_TYPE_BUY) ? bid : ask;
 
+   // --- RVI Invalidation: cross reversal → exit immediately ---
    double rviM1[1], rviM2[1], rviS1[1], rviS2[1];
    if(CopyBuffer(hRVI_M15, 0, 1, 1, rviM1) < 1) return;
    if(CopyBuffer(hRVI_M15, 0, 2, 1, rviM2) < 1) return;
    if(CopyBuffer(hRVI_M15, 1, 1, 1, rviS1) < 1) return;
    if(CopyBuffer(hRVI_M15, 1, 2, 1, rviS2) < 1) return;
 
-   // RVI Invalidation: cross reversal → exit immediately
    bool rviInvalidBuy  = (posType == POSITION_TYPE_BUY)  &&
                           rviM1[0] < rviS1[0] && rviM2[0] > rviS2[0];
    bool rviInvalidSell = (posType == POSITION_TYPE_SELL) &&
@@ -267,58 +252,30 @@ void ManageOpenPosition()
       return;
    }
 
-   // Optional partial close (disabled by default)
-   if(UsePartialClose && !partialDone)
+   // --- Breakeven: move SL to entry once profit ≥ BreakevenTrigger ---
+   if(!breakevenMoved)
    {
-      double profitDist = (posType == POSITION_TYPE_BUY)
-                          ? price - openPrice
-                          : openPrice - price;
-
-      if(profitDist >= tradeSLDist)
+      double floatingProfit = PositionGetDouble(POSITION_PROFIT);
+      if(floatingProfit >= BreakevenTrigger)
       {
-         double closeVol = NormalizeLot(lots * PartialClosePct);
-         if(closeVol >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
-         {
-            trade.PositionClosePartial(ticket, closeVol);
+         double spread = ask - bid;
+         double be     = (posType == POSITION_TYPE_BUY)
+                         ? NormalizeDouble(openPrice + spread, _Digits)  // cover spread
+                         : NormalizeDouble(openPrice - spread, _Digits);
 
-            double spread = ask - bid;
-            double be = (posType == POSITION_TYPE_BUY)
-                        ? openPrice + spread
-                        : openPrice - spread;
-            trade.PositionModify(_Symbol, NormalizeDouble(be, _Digits), curTP);
-            partialDone = true;
+         // Only modify if BE improves the current SL
+         bool shouldMove = (posType == POSITION_TYPE_BUY  && be > curSL) ||
+                           (posType == POSITION_TYPE_SELL && be < curSL);
 
-            double sar[1];
-            if(CopyBuffer(hSAR_M15, 0, 1, 1, sar) == 1)
-            {
-               if(posType == POSITION_TYPE_BUY && sar[0] > curSL && sar[0] < price)
-                  trade.PositionModify(_Symbol, NormalizeDouble(sar[0], _Digits), curTP);
-               else if(posType == POSITION_TYPE_SELL && sar[0] < curSL && sar[0] > price)
-                  trade.PositionModify(_Symbol, NormalizeDouble(sar[0], _Digits), curTP);
-            }
-         }
+         if(shouldMove && trade.PositionModify(_Symbol, be, curTP))
+            breakevenMoved = true;
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Position Sizing                                                  |
+//| Lot Normalization                                                |
 //+------------------------------------------------------------------+
-double CalcLotSize(double slDist)
-{
-   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmt  = balance * (RiskPercent / 100.0);
-   double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-
-   if(tickVal <= 0 || tickSize <= 0) return 0;
-
-   double slInTicks = slDist / tickSize;
-   double rawLot    = riskAmt / (slInTicks * tickVal);
-
-   return NormalizeLot(rawLot);
-}
-
 double NormalizeLot(double lot)
 {
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
