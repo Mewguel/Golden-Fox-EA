@@ -359,7 +359,8 @@ double PipsToPrice(double pips)
 bool IsNewsBlocked()
 {
    datetime now  = TimeCurrent();
-   datetime from = now - (datetime)(PauseBeforeNews * 60);  // look back for events already started
+   int lookbackMin = (int)MathMax(PauseBeforeNews, ResumeAfterNews);
+   datetime from = now - (datetime)(lookbackMin * 60);      // include full post-news horizon
    datetime to   = now + (datetime)(PauseBeforeNews * 60);  // look ahead full pause window
 
    MqlCalendarValue values[];
