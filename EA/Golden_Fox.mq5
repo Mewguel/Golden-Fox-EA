@@ -2,10 +2,10 @@
 //| XAUUSD Scalp-Intraday EA                                        |
 //| Strategy : 6 EMA + SAR + RVI(10) zone + H1/H4 EMA + ADX filter  |
 //| Platform  : MetaTrader 5 (MQL5)                                 |
-//| Version   : 2.5                                                 |
-//| Changes   : XAUUSD News Filter via MQL5 Economic Calendar.      |
-//|             Blocks new entries 60 min before / 45 min after      |
-//|             high-impact USD events. Tier 1 + Tier 2 keywords.   |
+//| Version   : 2.6                                                 |
+//| Changes   : Multi-signal invalidation score system.             |
+//|             EMA(+1) + RVI slope(+1) + SAR flip(+2) + RVI cross(+3)|
+//|             Score>=3 → close. Score==2 → breakeven. <=1 → ignore.|
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
@@ -27,7 +27,12 @@ input double             TP_Pips   = 100;          // Take profit in pips
 input double             MaxLotCap       = 0.12;   // Hard lot ceiling
 
 input group              "=== Breakeven ==="
-input double             BreakevenTrigger = 2.00;  // Float profit in $ to move SL to BE
+input double             BreakevenTrigger    = 2.00;  // Float profit in $ to move SL to BE
+
+input group              "=== Invalidation ==="
+input int                InvalidationThreshold = 3;   // Score to trigger close (3=exit, 2=BE)
+input int                EMAInvalidBars        = 1;   // Bars close must be below/above EMA
+input bool               UseRVISlope           = true; // Count RVI slope weakening (+1)
 
 
 input group              "=== Daily Guard ==="
@@ -222,8 +227,11 @@ void ExecuteTrade(int signal)
 
 //+------------------------------------------------------------------+
 //| Position Management                                              |
-//| - RVI cross reversal → close immediately                        |
-//| - Floating profit ≥ BreakevenTrigger ($) → move SL to BE        |
+//| Priority order:                                                  |
+//|   1. Score >= InvalidationThreshold → close trade               |
+//|   2. Score == 2 (and BE not yet moved) → move SL to BE          |
+//|   3. Existing BE trigger ($profit threshold)                     |
+//| Daily loss count: only incremented on closes at a loss.         |
 //+------------------------------------------------------------------+
 void ManageOpenPosition()
 {
@@ -237,26 +245,35 @@ void ManageOpenPosition()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-   // --- RVI Invalidation: cross reversal → exit immediately ---
-   double rviM1[1], rviM2[1], rviS1[1], rviS2[1];
-   if(CopyBuffer(hRVI_M15, 0, 1, 1, rviM1) < 1) return;
-   if(CopyBuffer(hRVI_M15, 0, 2, 1, rviM2) < 1) return;
-   if(CopyBuffer(hRVI_M15, 1, 1, 1, rviS1) < 1) return;
-   if(CopyBuffer(hRVI_M15, 1, 2, 1, rviS2) < 1) return;
+   // --- 1. Invalidation score ---
+   int score = GetInvalidationScore(posType);
 
-   bool rviInvalidBuy  = (posType == POSITION_TYPE_BUY)  &&
-                          rviM1[0] < rviS1[0] && rviM2[0] > rviS2[0];
-   bool rviInvalidSell = (posType == POSITION_TYPE_SELL) &&
-                          rviM1[0] > rviS1[0] && rviM2[0] < rviS2[0];
-
-   if(rviInvalidBuy || rviInvalidSell)
+   if(score >= InvalidationThreshold)
    {
+      double floatProfit = PositionGetDouble(POSITION_PROFIT);
       trade.PositionClose(_Symbol);
-      dailyLosses++;
+      if(floatProfit < 0) dailyLosses++;
       return;
    }
 
-   // --- Breakeven: move SL to entry once profit ≥ BreakevenTrigger ---
+   // --- 2. Score == 2: tighten risk by moving SL to BE ---
+   if(score == 2 && !breakevenMoved)
+   {
+      double spread = ask - bid;
+      double be     = (posType == POSITION_TYPE_BUY)
+                      ? NormalizeDouble(openPrice + spread, _Digits)
+                      : NormalizeDouble(openPrice - spread, _Digits);
+
+      bool shouldMove = (posType == POSITION_TYPE_BUY  && be > curSL) ||
+                        (posType == POSITION_TYPE_SELL && be < curSL);
+
+      if(shouldMove && trade.PositionModify(_Symbol, be, curTP))
+         breakevenMoved = true;
+
+      return;
+   }
+
+   // --- 3. Profit-triggered BE (existing logic, fires when score <= 1) ---
    if(!breakevenMoved)
    {
       double floatingProfit = PositionGetDouble(POSITION_PROFIT);
@@ -264,10 +281,9 @@ void ManageOpenPosition()
       {
          double spread = ask - bid;
          double be     = (posType == POSITION_TYPE_BUY)
-                         ? NormalizeDouble(openPrice + spread, _Digits)  // cover spread
+                         ? NormalizeDouble(openPrice + spread, _Digits)
                          : NormalizeDouble(openPrice - spread, _Digits);
 
-         // Only modify if BE improves the current SL
          bool shouldMove = (posType == POSITION_TYPE_BUY  && be > curSL) ||
                            (posType == POSITION_TYPE_SELL && be < curSL);
 
@@ -275,6 +291,87 @@ void ManageOpenPosition()
             breakevenMoved = true;
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| Invalidation Score                                               |
+//|                                                                  |
+//| Signal                  Weight  Trigger                         |
+//| EMA(6) failure            +1    close[1] crosses EMA[1]         |
+//| RVI slope weakening       +1    main approaching signal line     |
+//| SAR flip                  +2    SAR switches side                |
+//| RVI cross reversal        +3    main crosses signal (hard flip)  |
+//|                                                                  |
+//| Score >= 3 → close trade                                        |
+//| Score == 2 → move SL to breakeven                               |
+//| Score <= 1 → ignore (noise tolerance)                           |
+//+------------------------------------------------------------------+
+int GetInvalidationScore(long posType)
+{
+   int score = 0;
+
+   // Read all needed indicator values
+   double rviM1[2], rviS1[2];
+   double ema1[];  ArrayResize(ema1, EMAInvalidBars + 1);
+   double sar1[1];
+   double close1[]; ArrayResize(close1, EMAInvalidBars + 1);
+   double high1[1], low1[1];
+
+   if(CopyBuffer(hRVI_M15, 0, 1, 2, rviM1) < 2) return 0;
+   if(CopyBuffer(hRVI_M15, 1, 1, 2, rviS1) < 2) return 0;
+   if(CopyBuffer(hEMA_M15, 0, 1, EMAInvalidBars + 1, ema1)   < EMAInvalidBars + 1) return 0;
+   if(CopyBuffer(hSAR_M15, 0, 1, 1, sar1)                    < 1) return 0;
+   if(CopyClose(_Symbol, PERIOD_M15, 1, EMAInvalidBars + 1, close1) < EMAInvalidBars + 1) return 0;
+   if(CopyHigh (_Symbol, PERIOD_M15, 1, 1, high1) < 1) return 0;
+   if(CopyLow  (_Symbol, PERIOD_M15, 1, 1, low1)  < 1) return 0;
+
+   // rviM1[0] = bar[1] (most recent closed), rviM1[1] = bar[2]
+   // ema1[0]  = bar[1], close1[0] = bar[1]  (index 0 = most recent in copied array)
+
+   if(posType == POSITION_TYPE_BUY)
+   {
+      // RVI cross reversal (+3): main crossed BELOW signal on last bar
+      if(rviM1[0] < rviS1[0] && rviM1[1] > rviS1[1])
+         score += 3;
+
+      // RVI slope weakening (+1): main converging toward signal from above
+      else if(UseRVISlope && rviM1[0] > rviS1[0] &&
+              (rviM1[0] - rviS1[0]) < (rviM1[1] - rviS1[1]))
+         score += 1;
+
+      // EMA(6) failure (+1): close below EMA for EMAInvalidBars consecutive bars
+      bool emaFail = true;
+      for(int i = 0; i < EMAInvalidBars; i++)
+         if(close1[i] >= ema1[i]) { emaFail = false; break; }
+      if(emaFail) score += 1;
+
+      // SAR flip (+2): SAR now above price (flipped to bearish)
+      if(sar1[0] > high1[0])
+         score += 2;
+   }
+   else if(posType == POSITION_TYPE_SELL)
+   {
+      // RVI cross reversal (+3): main crossed ABOVE signal on last bar
+      if(rviM1[0] > rviS1[0] && rviM1[1] < rviS1[1])
+         score += 3;
+
+      // RVI slope weakening (+1): main converging toward signal from below
+      else if(UseRVISlope && rviM1[0] < rviS1[0] &&
+              (rviS1[0] - rviM1[0]) < (rviS1[1] - rviM1[1]))
+         score += 1;
+
+      // EMA(6) failure (+1): close above EMA for EMAInvalidBars consecutive bars
+      bool emaFail = true;
+      for(int i = 0; i < EMAInvalidBars; i++)
+         if(close1[i] <= ema1[i]) { emaFail = false; break; }
+      if(emaFail) score += 1;
+
+      // SAR flip (+2): SAR now below price (flipped to bullish)
+      if(sar1[0] < low1[0])
+         score += 2;
+   }
+
+   return score;
 }
 
 //+------------------------------------------------------------------+
