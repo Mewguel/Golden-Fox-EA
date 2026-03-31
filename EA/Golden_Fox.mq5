@@ -369,12 +369,11 @@ bool IsNewsBlocked()
 
    for(int i = 0; i < ArraySize(values); i++)
    {
-      // High-impact USD events only
+      // High-impact events only — currency already filtered by CalendarValueHistory()
       MqlCalendarEvent ev;
       if(!CalendarEventById(values[i].event_id, ev)) continue;
-      if(ev.importance != CALENDAR_IMPORTANCE_HIGH)    continue;
-      if(ev.currency   != "USD")                       continue;
-      if(!IsRelevantEvent(ev.name))                    continue;
+      if(ev.importance != CALENDAR_IMPORTANCE_HIGH)  continue;
+      if(!IsRelevantEvent(ev.name))                  continue;
 
       datetime newsTime = values[i].time;
 
