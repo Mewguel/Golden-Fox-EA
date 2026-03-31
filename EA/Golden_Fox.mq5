@@ -2,10 +2,10 @@
 //| XAUUSD Scalp-Intraday EA                                        |
 //| Strategy : 6 EMA + SAR + RVI(10) zone + H1/H4 EMA + ADX filter  |
 //| Platform  : MetaTrader 5 (MQL5)                                 |
-//| Version   : 2.4                                                 |
-//| Changes   : RVI entry uses fresh cross detection, not trend      |
-//|             continuation. Captures initial impulse on the bar    |
-//|             the cross fires — reduces late-entry lag on M15.     |
+//| Version   : 2.5                                                 |
+//| Changes   : XAUUSD News Filter via MQL5 Economic Calendar.      |
+//|             Blocks new entries 60 min before / 45 min after      |
+//|             high-impact USD events. Tier 1 + Tier 2 keywords.   |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
@@ -40,6 +40,11 @@ input int                LondonOpen      = 7;
 input int                LondonClose     = 16;
 input int                NYOpen          = 12;
 input int                NYClose         = 21;
+
+input group              "=== News Filter ==="
+input bool               UseNewsFilter    = true;   // Enable economic calendar filter
+input int                PauseBeforeNews  = 60;     // Minutes to pause before event
+input int                ResumeAfterNews  = 45;     // Minutes to resume after event
 
 input group              "=== General ==="
 input int                MagicNumber     = 202402;
@@ -98,6 +103,8 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   if(UseNewsFilter && IsNewsBlocked()) return;
+
    if(!IsNewBar()) return;
 
    ResetDailyIfNeeded();
@@ -341,5 +348,76 @@ double PipsToPrice(double pips)
       pipSize *= 10;
 
    return pips * pipSize;
+}
+
+//+------------------------------------------------------------------+
+//| News Filter — MQL5 Economic Calendar                             |
+//| Blocks new entries PauseBeforeNews min before and               |
+//| ResumeAfterNews min after any high-impact USD event.            |
+//| Open positions are NOT closed — only new entries are blocked.   |
+//+------------------------------------------------------------------+
+bool IsNewsBlocked()
+{
+   datetime now  = TimeCurrent();
+   datetime from = now - (datetime)(PauseBeforeNews * 60);  // look back for events already started
+   datetime to   = now + (datetime)(PauseBeforeNews * 60);  // look ahead full pause window
+
+   MqlCalendarValue values[];
+   if(CalendarValueHistory(values, from, to, NULL, "USD") <= 0)
+      return false;
+
+   for(int i = 0; i < ArraySize(values); i++)
+   {
+      // High-impact USD events only
+      MqlCalendarEvent ev;
+      if(!CalendarEventById(values[i].event_id, ev)) continue;
+      if(ev.importance != CALENDAR_IMPORTANCE_HIGH)    continue;
+      if(ev.currency   != "USD")                       continue;
+      if(!IsRelevantEvent(ev.name))                    continue;
+
+      datetime newsTime = values[i].time;
+
+      bool inPreWindow  = (now >= newsTime - (datetime)(PauseBeforeNews * 60) &&
+                           now <  newsTime);
+      bool inPostWindow = (now >= newsTime &&
+                           now <= newsTime + (datetime)(ResumeAfterNews * 60));
+
+      if(inPreWindow || inPostWindow)
+      {
+         PrintFormat("NEWS BLOCK: %s at %s — trading paused", ev.name,
+                     TimeToString(newsTime, TIME_DATE | TIME_MINUTES));
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Relevant event keyword matching                                  |
+//| Tier 1: FOMC, CPI, NFP, PCE, Jackson Hole                      |
+//| Tier 2: GDP, Retail Sales, ISM, Unemployment                    |
+//+------------------------------------------------------------------+
+bool IsRelevantEvent(const string eventName)
+{
+   string keywords[] =
+   {
+      "FOMC", "Federal Funds", "Jackson Hole",
+      "CPI", "Core CPI", "Consumer Price",
+      "Non-Farm", "NFP", "Nonfarm",
+      "PCE", "Personal Consumption",
+      "GDP", "Gross Domestic",
+      "Retail Sales",
+      "ISM Manufacturing", "ISM Services", "ISM Non-Manufacturing",
+      "Unemployment Claims", "Initial Claims"
+   };
+
+   for(int k = 0; k < ArraySize(keywords); k++)
+   {
+      if(StringFind(eventName, keywords[k]) >= 0)
+         return true;
+   }
+
+   return false;
 }
 //+------------------------------------------------------------------+
