@@ -251,7 +251,7 @@ void ManageOpenPosition()
    if(score >= InvalidationThreshold)
    {
       double floatProfit = PositionGetDouble(POSITION_PROFIT);
-      trade.PositionClose(_Symbol);
+      if(!trade.PositionClose(_Symbol)) return;
       if(floatProfit < 0) dailyLosses++;
       return;
    }
