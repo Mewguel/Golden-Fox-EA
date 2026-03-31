@@ -108,12 +108,12 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   ResetDailyIfNeeded();
+   ManageOpenPosition();
+
    if(UseNewsFilter && IsNewsBlocked()) return;
 
    if(!IsNewBar()) return;
-
-   ResetDailyIfNeeded();
-   ManageOpenPosition();
 
    if(IsTradingHalted()) return;
    if(HasOpenPosition())  return;
